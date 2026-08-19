@@ -88,3 +88,35 @@ CMakeCache.txt
 CMakeFiles/
 CMakeInit.txt
 cmake_install.cmake
+
+# ── ReID pipeline ───────────────────────────────────────────────────────────
+# Data, weights and outputs. Everything here is per-camera or regenerable and
+# belongs with the camera or the run, not in the repo.
+# (gitignore has no trailing comments — one pattern per line, nothing after it)
+calib/
+runs/
+gallery/
+models/
+frames/
+bench/data/
+# generated labelling pages; the .json ground truth is kept
+labels/*.html
+*.npz
+*.npy
+*.mp4
+*.avi
+*.mkv
+*.onnx
+*.onnx.data
+*.engine
+*.log
+
+# ── Tooling and editor noise ────────────────────────────────────────────────
+.omc/
+.claude/
+.idea/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+*.py[cod]

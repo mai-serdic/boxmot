@@ -1,223 +1,112 @@
-<div align="center" markdown="1">
+# SOLUTION_ReID
 
-  <img width="640"
-       src="https://github.com/mikel-brostrom/boxmot/releases/download/v12.0.0/output_640.gif"
-       alt="BoxMOT demo">
-  <br>
+Person re-identification for fixed CCTV, built on the premise that **appearance
+is not enough**. Workers change clothes, put on and take off hi-vis vests, and
+are seen from behind most of the time. What stays constant is the space they
+move through, so this system reasons about the floor in metres and about whole
+motion paths, and uses appearance only as one signal among several.
 
-  <a href="https://trendshift.io/repositories/13239" target="_blank"><img src="https://trendshift.io/api/badge/repositories/13239" alt="mikel-brostrom%2Fboxmot | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"></a>
+Measured: the body embedding separates same-person from different-person pairs
+at 0.944 AUC *within* a tracklet and only **0.803** across tracklets, and a
+0.55 embedding veto refuses **24.5%** of genuine re-entries. Replacing the
+pixel-space spatial prior with a geodesic one on the walkable floor took
+re-identification ranking accuracy from **61.7% to 84.9%**. Full numbers and
+the negative results in [`bench/REPORT.md`](bench/REPORT.md).
 
-  [![CI](https://github.com/mikel-brostrom/boxmot/actions/workflows/ci.yml/badge.svg)](https://github.com/mikel-brostrom/boxmot/actions/workflows/ci.yml)
-  [![PyPI version](https://badge.fury.io/py/boxmot.svg)](https://badge.fury.io/py/boxmot)
-  [![downloads](https://static.pepy.tech/badge/boxmot)](https://pepy.tech/project/boxmot)
-  [![license](https://img.shields.io/badge/license-AGPL%203.0-blue)](https://github.com/mikel-brostrom/boxmot/blob/master/LICENSE)
-  [![python-version](https://img.shields.io/pypi/pyversions/boxmot)](https://badge.fury.io/py/boxmot)
-  [![colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/18nIqkBr68TkK8dHdarxTco6svHUJGggY?usp=sharing)
-  [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.8132989.svg)](https://doi.org/10.5281/zenodo.8132989)
-  [![docker pulls](https://img.shields.io/docker/pulls/boxmot/boxmot?logo=docker)](https://hub.docker.com/r/boxmot/boxmot)
-  [![discord](https://img.shields.io/discord/1377565354326495283?logo=discord&label=discord&labelColor=fff&color=5865f2)](https://discord.gg/tUmFEcYU4q)
-  [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/mikel-brostrom/boxmot)
+## How it works
 
-</div>
+```
+footage ──▶ commission_scene.py ──▶ calib/<camera>/     (once per camera)
+                                     scene.json          ground plane, metres
+                                     scene_depth.npz     height above floor
+                                     08_metre_check.png  the sheet you check
 
-BoxMOT gives you one CLI and one Python API for running modern multi-object tracking workflows. It covers direct tracking, cached benchmark evaluation, tuning, research loops, and ReID export without forcing you to rebuild the detector and tracker stack for each experiment.
+footage ──▶ track_rtdetr_db.py ──▶ runs/traj/<clip>.json
+             RT-DETRv4 + BoT-SORT + CLIP/OSNet embeddings
+             + ghost pool (rebinding) + geodesic reachability prior
+```
 
-<div align="center" markdown="1">
+**Commissioning takes no annotation.** No checkerboard, no surveyor, no drawn
+zones, no marked doorways. The ground plane is fitted from people walking
+through the frame, which is what makes it transferable to a new camera instead
+of a per-site ritual. It has been run on three unrelated rooms.
 
-[Docs](docs/index.md) • [Installation](docs/getting-started/installation.md) • [Modes](docs/modes/index.md) • [API Reference](docs/python/index.md) • [Trackers](docs/trackers/index.md) • [Contributing](CONTRIBUTING.md)
+Accept a calibration only from `08_metre_check.png` — a 1 m floor grid and
+1.70 m human silhouettes drawn back into the image. If the squares are not
+square and the sticks do not match real people, no summary statistic should
+talk you out of it. This has caught a real bug.
 
-</div>
+## Modules
 
-## Why BoxMOT
+| file | what it does |
+|---|---|
+| `reid/scene_geometry.py` | ground plane from pedestrians: distortion, horizon, focal, metre scale |
+| `reid/scene_depth.py` | monocular depth → height above floor → occluder map; stature bias field |
+| `reid/reachability.py` | geodesic prior — could a person have *walked* from here to there? |
+| `reid/trajectory_stitch.py` | min-cost flow over the tracklet graph; one unit of flow = one person's path |
+| `reid/motion_prior.py` | learned (cell, heading) Markov model of how people move through the room |
+| `reid/ghost_pool.py` | within-session rebinding of lost tracks, multi-signal with an embedding veto |
+| `reid/person_db.py` | persistent gallery that survives across runs and days |
+| `reid/face_anchor.py` | pose-gated face confirmation (confirm-only; a mismatch never blocks) |
 
-- One interface for `track`, `generate`, `eval`, `tune`, `research`, and `export`.
-- Swappable trackers with shared detector and ReID plumbing.
-- Benchmark-oriented workflows with reusable detections and embeddings.
-- Support for both AABB and OBB tracking paths.
-- Optional production-ready native C++ tracker implementations with the same metrics as the Python path, opted into via `--tracker-backend cpp` and embeddable in standalone C++ projects via CMake (see [Native C++ Integration](docs/guides/native-cpp.md)).
-- Public Python API for embedding the same workflows in applications and notebooks.
+## Layout
 
-## Installation
+```
+reid/       the library — pure algorithm, no I/O beyond load/save
+scripts/    command-line entry points (commission, track, label, render)
+bench/      13 numbered benchmarks + REPORT.md, negative results included
+docs/       COMMISSIONING.md — how to commission a camera and what to check
+labels/     hand ground truth for the benchmarks
+models/     detector and ReID weights (gitignored)
+calib/      commissioned scenes, one per camera (gitignored)
+runs/       tracking output (gitignored)
+gallery/    persistent person galleries (gitignored)
+videos/     source footage (gitignored)
+boxmot/     vendored upstream tracker — BoT-SORT, ByteTrack, ReID zoo
+```
 
-BoxMOT supports Python `3.9` through `3.12`.
+`bench/REPORT.md` is a dated record and refers to modules by bare filename
+(`scene_geometry.py`); it predates the move into `reid/`.
+
+## Usage
 
 ```bash
-pip install boxmot
-boxmot --help
+pip install -r requirements.txt   # boxmot itself is vendored in this repo
+
+# 1. Commission a camera. Input is footage and nothing else.
+#    Use the whole session, not one clip — calibration is a property of the
+#    camera, and a 30 s clip yields too few tracklets to fit it.
+python scripts/commission_scene.py --name mycam --input footage.mp4 --fps 10
+
+# 2. Look at calib/mycam/08_metre_check.png before trusting anything.
+
+# 3. Track.
+python scripts/track_rtdetr_db.py \
+    --input clip.mp4 --scene calib/mycam \
+    --gallery gallery/mycam/persons.npz \
+    --dump-json runs/traj/clip.json
+
+# 4. Reproduce the benchmarks.
+python bench/08_eval_geodesic_prior.py --scene calib/mycam \
+    --traj runs/traj/clip.json --labels labels/mycam.json
 ```
 
-For mode-specific extras such as `yolo`, `evolve`, `research`, `onnx`, `openvino`, and `tflite`, see the [installation guide](docs/getting-started/installation.md).
+## What is not here
 
-## Benchmark Results (MOT17 ablation split)
+Model weights, footage, commissioned scenes and pipeline output are all
+gitignored. This repo is source only. Weights come from `boxmot`'s model zoo
+(OSNet, CLIP-ReID) plus an RT-DETRv4 ONNX detector; `calib/` is per-camera and
+belongs with the camera.
 
-<div align="center" markdown="1">
+## Known limitations
 
-<!-- START TRACKER TABLE -->
-<table>
-  <thead>
-    <tr>
-      <th rowspan="2" align="left">Tracker</th>
-      <th colspan="4" align="center">Python</th>
-      <th colspan="4" align="center">C++</th>
-    </tr>
-    <tr>
-      <th align="right">HOTA</th>
-      <th align="right">MOTA</th>
-      <th align="right">IDF1</th>
-      <th align="center">OBB</th>
-      <th align="right">HOTA</th>
-      <th align="right">MOTA</th>
-      <th align="right">IDF1</th>
-      <th align="center">OBB</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td align="left">occluboost</td>
-      <td align="right">70.47</td>
-      <td align="right">78.32</td>
-      <td align="right">84.14</td>
-      <td align="center">✅</td>
-      <td align="right">70.48</td>
-      <td align="right">78.31</td>
-      <td align="right">84.14</td>
-      <td align="center">✅</td>
-    </tr>
-    <tr>
-      <td align="left"><a href="https://arxiv.org/abs/2206.14651">botsort</a></td>
-      <td align="right">69.44</td>
-      <td align="right">78.24</td>
-      <td align="right">81.94</td>
-      <td align="center">✅</td>
-      <td align="right">69.43</td>
-      <td align="right">78.26</td>
-      <td align="right">82.00</td>
-      <td align="center">✅</td>
-    </tr>
-    <tr>
-      <td align="left"><a href="https://arxiv.org/abs/2408.13003">boosttrack</a></td>
-      <td align="right">69.25</td>
-      <td align="right">75.91</td>
-      <td align="right">83.20</td>
-      <td align="center">❌</td>
-      <td align="right">—</td>
-      <td align="right">—</td>
-      <td align="right">—</td>
-      <td align="center">—</td>
-    </tr>
-    <tr>
-      <td align="left"><a href="https://arxiv.org/abs/2202.13514">strongsort</a></td>
-      <td align="right">68.05</td>
-      <td align="right">76.19</td>
-      <td align="right">80.76</td>
-      <td align="center">❌</td>
-      <td align="right">—</td>
-      <td align="right">—</td>
-      <td align="right">—</td>
-      <td align="center">—</td>
-    </tr>
-    <tr>
-      <td align="left"><a href="https://arxiv.org/abs/2302.11813">deepocsort</a></td>
-      <td align="right">67.95</td>
-      <td align="right">75.83</td>
-      <td align="right">80.54</td>
-      <td align="center">❌</td>
-      <td align="right">—</td>
-      <td align="right">—</td>
-      <td align="right">—</td>
-      <td align="center">—</td>
-    </tr>
-    <tr>
-      <td align="left"><a href="https://arxiv.org/abs/2110.06864">bytetrack</a></td>
-      <td align="right">67.68</td>
-      <td align="right">78.04</td>
-      <td align="right">79.16</td>
-      <td align="center">✅</td>
-      <td align="right">67.75</td>
-      <td align="right">78.03</td>
-      <td align="right">79.38</td>
-      <td align="center">✅</td>
-    </tr>
-    <tr>
-      <td align="left"><a href="https://arxiv.org/abs/2308.00783">hybridsort</a></td>
-      <td align="right">67.31</td>
-      <td align="right">74.09</td>
-      <td align="right">78.87</td>
-      <td align="center">❌</td>
-      <td align="right">—</td>
-      <td align="right">—</td>
-      <td align="right">—</td>
-      <td align="center">—</td>
-    </tr>
-    <tr>
-      <td align="left"><a href="https://arxiv.org/abs/2203.14360">ocsort</a></td>
-      <td align="right">66.44</td>
-      <td align="right">74.55</td>
-      <td align="right">77.90</td>
-      <td align="center">✅</td>
-      <td align="right">66.44</td>
-      <td align="right">74.55</td>
-      <td align="right">77.90</td>
-      <td align="center">✅</td>
-    </tr>
-    <tr>
-      <td align="left"><a href="https://arxiv.org/pdf/2404.07553">sfsort</a></td>
-      <td align="right">62.65</td>
-      <td align="right">76.87</td>
-      <td align="right">69.18</td>
-      <td align="center">✅</td>
-      <td align="right">62.66</td>
-      <td align="right">76.74</td>
-      <td align="right">69.18</td>
-      <td align="center">✅</td>
-    </tr>
-  </tbody>
-</table>
-<!-- END TRACKER TABLE -->
-
-<sub>Evaluation was run on the second half of the MOT17 training set because the validation split is not public and the ablation detector was trained on the first half. Results used [pre-generated detections and embeddings](https://github.com/mikel-brostrom/boxmot/releases/download/v11.0.9/runs2.zip) with each tracker configured from its default repository settings. Native `cpp` cells use `--tracker-backend cpp` for the implemented replay backends.</sub>
-
-</div>
-
-Related guides:
-
-- [Evaluation and Postprocessing](docs/guides/evaluation.md)
-- [Benchmark Workflows](docs/guides/benchmarks.md)
-- [Native C++ Integration](docs/guides/native-cpp.md)
-
-## Minimal Usage
-
-CLI:
-
-```bash
-boxmot track --detector yolov8n --reid osnet_x0_25_msmt17 --tracker botsort --source video.mp4 --save
-```
-
-Python:
-
-```python
-from boxmot import Boxmot
-
-run = Boxmot(detector="yolov8n", reid="osnet_x0_25_msmt17", tracker="botsort").track(
-    source="video.mp4",
-    save=True,
-)
-print(run)
-```
-
-## Contributing
-
-Start with [CONTRIBUTING.md](CONTRIBUTING.md) and the [contributor docs](docs/contributing/index.md).
-
-## Contributors
-
-<a href="https://github.com/mikel-brostrom/boxmot/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=mikel-brostrom/boxmot" alt="BoxMOT contributors">
-</a>
-
-## Support and Citation
-
-- Bugs and feature requests: [GitHub Issues](https://github.com/mikel-brostrom/boxmot/issues)
-- Questions and discussion: [GitHub Discussions](https://github.com/mikel-brostrom/boxmot/discussions) or [Discord](https://discord.gg/tUmFEcYU4q)
-- Citation metadata: [CITATION.cff](https://github.com/mikel-brostrom/boxmot/blob/master/CITATION.cff)
-- Commercial support: `box-mot@outlook.com`
+- `birth_cost` in `trajectory_stitch` does not transfer between cameras
+  (gunsan is flat 1.5–6.0, another camera needs ≥4.0). It should be derived
+  from the observed link-probability distribution rather than fixed.
+- Monocular depth scale can be badly off on some rooms (2.5× on one camera).
+  The ground plane stays correct, but the occluder map does not.
+- The global stitcher is validated in `bench/` but is not yet wired into the
+  tracking pipeline, which still ships the greedy ghost-pool result.
+- Stature was tested as an identity cue and **rejected** (AUC 0.574): human
+  stature spread is ~0.07 m against 0.12–0.24 m of instrument noise. See
+  REPORT §12 before trying it again.

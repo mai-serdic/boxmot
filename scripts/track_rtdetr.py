@@ -14,7 +14,13 @@ Usage:
 
 import argparse
 import os
+import sys
 from pathlib import Path
+
+# Make the repo root importable so `boxmot` and `reid` resolve when this
+# script is run as scripts/track_rtdetr.py.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import cv2
 import numpy as np

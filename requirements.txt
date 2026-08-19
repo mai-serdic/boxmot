@@ -1,0 +1,22 @@
+# Tracking backbone (BoT-SORT, ByteTrack, ReID model zoo).
+# Stock upstream is sufficient: every tracker parameter is passed
+# explicitly in scripts/track_rtdetr*.py, so none of boxmot's shipped
+# YAML defaults are relied on.
+boxmot
+
+numpy
+scipy
+opencv-python
+networkx            # min-cost flow in trajectory_stitch
+matplotlib          # commissioning image pack
+
+# Detector + embeddings
+onnxruntime-gpu     # CPU-only installs: use onnxruntime instead
+torch
+torchvision
+
+# Monocular metric depth (scene_depth / commission_scene)
+transformers
+
+# Optional: face anchoring (scripts/track_rtdetr_db.py --face)
+# insightface
