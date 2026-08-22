@@ -84,9 +84,22 @@ class RadialModel:
         r2 = (p ** 2).sum(axis=1, keepdims=True)
         return p / (1.0 + self.k1 * r2)
 
+    def distort_norm(self, pts_undist: np.ndarray) -> np.ndarray:
+        """Inverse of ``undistort_norm``. Fixed-point, same as ``undistort_image``."""
+        xu = np.asarray(pts_undist, dtype=np.float64).reshape(-1, 2)
+        xd = xu.copy()
+        for _ in range(12):
+            r2 = (xd ** 2).sum(axis=1, keepdims=True)
+            xd = xu * (1.0 + self.k1 * r2)
+        return xd
+
     def undistort_points(self, pts_pixel: np.ndarray) -> np.ndarray:
         """Pixel -> undistorted normalized coords (the space all geometry uses)."""
         return self.undistort_norm(self.to_norm(pts_pixel))
+
+    def distort_points(self, pts_undist: np.ndarray) -> np.ndarray:
+        """Undistorted normalized coords -> distorted pixels."""
+        return self.to_pixel(self.distort_norm(pts_undist))
 
     def undistort_image(self, img: np.ndarray) -> np.ndarray:
         h, w = img.shape[:2]
@@ -669,6 +682,23 @@ class GroundPlane:
             np.nan,
         )
         return np.stack([X @ self.e1, X @ self.e2], axis=1)
+
+    def pixels_from_floor(self, xy: np.ndarray) -> np.ndarray:
+        """Inverse of ``floor_xy``: floor metres (N,2) -> distorted pixels (N,2).
+
+        Used to draw a saved plan back onto the image. Points that project
+        behind the camera come back as NaN rather than wrapping around.
+        """
+        xy = np.atleast_2d(np.asarray(xy, float))
+        # Camera at the origin; the floor is X · r3 = cam_height_m.
+        X = (self.cam_height_m * self.r3
+             + xy[:, 0:1] * self.e1 + xy[:, 1:2] * self.e2)
+        z = X[:, 2]
+        und = np.full((len(xy), 2), np.nan)
+        ok = np.abs(z) > 1e-9
+        und[ok, 0] = self.f * X[ok, 0] / z[ok]
+        und[ok, 1] = self.f * X[ok, 1] / z[ok]
+        return self.radial_model().distort_points(und)
 
     def stature_m(self, foot_h: np.ndarray, head_h: np.ndarray) -> np.ndarray:
         """Metric height of the upright whose base is `foot_h` and top `head_h`.

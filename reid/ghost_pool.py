@@ -37,11 +37,15 @@ from typing import Optional
 
 import numpy as np
 
-try:
-    from reachability import Reachability, ReachParams, rebind_prior
-except Exception:                                # module is optional
-    Reachability = ReachParams = None            # type: ignore
-    rebind_prior = None                          # type: ignore
+# Hard import on purpose. This used to be wrapped in `except Exception: pass`
+# "because the module is optional", and when the package layout changed the
+# import broke silently: rebind_prior went None, _spatial_prior_geo returned
+# None on every call, `feasible` defaulted to True so the reachability veto
+# never fired, and summary() still printed "prior=geodesic". The pool ran on
+# appearance and a pixel Gaussian while reporting that it was using the floor.
+# reachability is a sibling module in this package -- it cannot be absent, and
+# if it ever is, that is a broken install and should say so loudly.
+from .reachability import rebind_prior
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -167,7 +171,7 @@ def _spatial_prior_geo(ghost: GhostTrack, new: NewTrackInfo,
                        params) -> Optional[dict]:
     """Geodesic prior over the walkable floor. None if either end lacks a
     metric position, so the caller can fall back."""
-    if reach is None or rebind_prior is None:
+    if reach is None:
         return None
     if ghost.last_xy is None or new.xy is None:
         return None

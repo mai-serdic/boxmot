@@ -40,6 +40,7 @@ from reid.ghost_pool import GhostPool, GhostTrack, NewTrackInfo, ScoringWeights
 from reid.reachability import Reachability, ReachParams
 from reid.scene_geometry import GroundPlane
 from reid.scene_depth import SceneModel, floor_from_boxes
+from reid.floor_plan import FloorPlan
 # face_anchor is imported lazily in run() — insightface is only needed with --face
 
 
@@ -199,7 +200,7 @@ def run(args):
     # ── 5a. Face anchor (clothing-independent identity cue, optional) ───────
     face_anchor = None
     if args.face:
-        from face_anchor import FaceAnchor
+        from reid.face_anchor import FaceAnchor
 
         face_anchor = FaceAnchor(
             det_score_min=args.face_det_min,
@@ -215,6 +216,7 @@ def run(args):
     ghost_pool = None
     reach = reach_params = None
     scene_gp = scene_model = reach_cache = None
+    reach_auto_tier = None
     if not args.disable_ghost_pool:
         weights = ScoringWeights(
             w_spatial=args.ghost_w_spatial,
@@ -240,6 +242,31 @@ def run(args):
                 reach = Reachability.build(_sc)
                 print("[INFO] Reachability built from depth only "
                       "(will sharpen as feet are observed)")
+            # A hand-drawn plan overrides the depth-derived tiers. On a big
+            # room the monocular depth is not good enough to separate floor
+            # from furniture (office_cam1: 152 cm of error on known floor,
+            # against a 20 cm threshold), which leaves ~89% of the map UNKNOWN
+            # and the geodesic prior with nothing to say. Two minutes of
+            # drawing replaces that with a real boundary.
+            _fp = Path(args.floor_plan) if args.floor_plan else _sdir / "floor_plan.json"
+            if args.floor_plan or _fp.exists():
+                if not _fp.exists():
+                    sys.exit(f"--floor-plan {_fp} does not exist")
+                # Stamp a working copy. The auto tier is what we write back
+                # at the end -- otherwise deleting the JSON would leave the
+                # drawing baked into reachability.npz forever.
+                reach_auto_tier = reach.tier.copy()
+                _plan = FloorPlan.load(_fp)
+                _plan.apply_to(reach)
+                print(f"[INFO] floor plan applied from {_fp}")
+                for i, ht in enumerate(_plan.obstacle_heights(_sc)):
+                    if ht["cls"] == "unseen":
+                        print(f"[INFO]   blocked polygon {i}: depth never saw this cell "
+                              f"({ht['n_cells']} cells) -- height unknown")
+                    else:
+                        print(f"[INFO]   blocked polygon {i}: {ht['cls']}  "
+                              f"(p50={ht['height_p50_m']:.2f}m p90={ht['height_p90_m']:.2f}m "
+                              f"max={ht['height_max_m']:.2f}m, {ht['n_seen']}/{ht['n_cells']} cells seen)")
             reach_params = ReachParams(v_max=args.ghost_vmax,
                                        slack_m=args.ghost_reach_slack)
             print(f"[INFO] {reach.summary()}  v_max={args.ghost_vmax} m/s")
@@ -642,6 +669,13 @@ def run(args):
         # whole no-annotation story: the site commissions itself by being
         # walked through.
         if reach is not None and reach_cache is not None:
+            if reach_auto_tier is not None:
+                from reid.reachability import FREE, MIN_FOOT_OBS
+                _saved = reach_auto_tier.copy()
+                _saved[reach.foot_obs >= MIN_FOOT_OBS] = FREE
+                reach.tier = _saved
+                reach._fields.clear()
+                reach._region = None
             reach.save(reach_cache)
             print(f"[DONE] {reach.summary()} -> {reach_cache}")
 
@@ -720,6 +754,12 @@ if __name__ == "__main__":
         "--scene", type=str, default=None,
         help="commissioned calib dir (scene.json + scene_depth.npz) enabling "
              "the geodesic walkable-floor prior for ghost rebinding",
+    )
+    p.add_argument(
+        "--floor-plan", type=str, default=None,
+        help="hand-drawn walkable/obstacle polygons from "
+             "scripts/annotate_floor.py; overrides the depth-derived walkable "
+             "map. Defaults to <scene>/floor_plan.json when that file exists",
     )
     p.add_argument(
         "--disable-geo-prior", action="store_true",

@@ -97,7 +97,7 @@ def _state(f, xy, i, fps, win, direction):
 def link_prob(reach, a: Tracklet, b: Tracklet, fps: float, params,
               w_emb: float = 0.0) -> float:
     """P(b continues a). 0 means the graph gets no edge at all."""
-    from reachability import rebind_prior
+    from .reachability import rebind_prior
 
     if b.t0 <= a.t1 - OVERLAP_TOL_F:
         return 0.0                      # too much overlap to be one body
@@ -123,7 +123,7 @@ def stitch_greedy(reach, tracklets, fps=15.0, params=None, w_emb=0.0,
                   thresh=0.25) -> dict[int, int]:
     """What the ghost pool effectively does: walk forward in time, attach each
     new tracklet to the best-scoring earlier one, never revise."""
-    from reachability import ReachParams
+    from .reachability import ReachParams
     params = params or ReachParams()
     ts = sorted(tracklets, key=lambda t: t.t0)
     owner = {t.tid: t.tid for t in ts}          # tid -> identity id
@@ -153,7 +153,7 @@ def stitch_global(reach, tracklets, fps=15.0, params=None, w_emb=0.0,
     nats of link implausibility you are willing to tolerate rather than invent
     a new person.
     """
-    from reachability import ReachParams
+    from .reachability import ReachParams
     if nx is None:
         raise RuntimeError("networkx is required for global stitching")
     params = params or ReachParams()
