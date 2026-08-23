@@ -24,6 +24,7 @@ footage ──▶ commission_scene.py ──▶ calib/<camera>/     (once per ca
 footage ──▶ track_rtdetr_db.py ──▶ runs/traj/<clip>.json
              RT-DETRv4 + BoT-SORT + CLIP/OSNet embeddings
              + ghost pool (rebinding) + geodesic reachability prior
+             ──▶ stitch_traj.py   whole-path IDs (offline post-pass)
 ```
 
 **Commissioning takes no annotation.** No checkerboard, no surveyor, no drawn
@@ -43,6 +44,7 @@ talk you out of it. This has caught a real bug.
 | `reid/scene_geometry.py` | ground plane from pedestrians: distortion, horizon, focal, metre scale |
 | `reid/scene_depth.py` | monocular depth → height above floor → occluder map; stature bias field |
 | `reid/reachability.py` | geodesic prior — could a person have *walked* from here to there? |
+| `reid/floor_plan.py` | hand-drawn walkable/obstacle footprints, stamped onto the reach map |
 | `reid/trajectory_stitch.py` | min-cost flow over the tracklet graph; one unit of flow = one person's path |
 | `reid/motion_prior.py` | learned (cell, heading) Markov model of how people move through the room |
 | `reid/ghost_pool.py` | within-session rebinding of lost tracks, multi-signal with an embedding veto |
@@ -56,6 +58,7 @@ reid/       the library — pure algorithm, no I/O beyond load/save
 scripts/    command-line entry points (commission, track, label, render)
 bench/      13 numbered benchmarks + REPORT.md, negative results included
 docs/       COMMISSIONING.md — how to commission a camera and what to check
+            DELIVERY.md — what this repo ships (scripts + demo); web-team handoff
 labels/     hand ground truth for the benchmarks
 models/     detector and ReID weights (gitignored)
 calib/      commissioned scenes, one per camera (gitignored)
@@ -84,29 +87,40 @@ python scripts/commission_scene.py --name mycam --input footage.mp4 --fps 10
 python scripts/track_rtdetr_db.py \
     --input clip.mp4 --scene calib/mycam \
     --gallery gallery/mycam/persons.npz \
-    --dump-json runs/traj/clip.json
+    --dump-json runs/traj/clip.json --stitch \
+    --output runs/track/clip.mp4
 
-# 4. Reproduce the benchmarks.
+# 4. Reproduce the geodesic-prior benchmark.
 python bench/08_eval_geodesic_prior.py --scene calib/mycam \
     --traj runs/traj/clip.json --labels labels/mycam.json
+
+# 5. Stitch whole paths (offline). Omit --birth to derive it from the links.
+python scripts/stitch_traj.py --scene calib/mycam \
+    --traj runs/traj/clip.json --out runs/traj/clip_stitched.json
 ```
 
 ## What is not here
 
 Model weights, footage, commissioned scenes and pipeline output are all
-gitignored. This repo is source only. Weights come from `boxmot`'s model zoo
-(OSNet, CLIP-ReID) plus an RT-DETRv4 ONNX detector; `calib/` is per-camera and
-belongs with the camera.
+gitignored. This repo is source only.
+
+**This is not the factory product.** DeepStream, BEV, Control-API, agents and
+attendance are owned by the web / on-site stack. What you ship from here is
+the pipeline scripts, a stitch JSON, and a demo video. What to *propose* they
+wire is in [`docs/DELIVERY.md`](docs/DELIVERY.md).
 
 ## Known limitations
 
-- `birth_cost` in `trajectory_stitch` does not transfer between cameras
-  (gunsan is flat 1.5–6.0, another camera needs ≥4.0). It should be derived
-  from the observed link-probability distribution rather than fixed.
+- `birth_cost` is derived from occupancy and the prior floor (`p_floor`
+  hops, clipped to [4, 6]). Cheap best-incomings can be impostors; true
+  long-gap re-entries often sit at `p_floor`, which is why office_cam1
+  needs 6 rather than 4.
 - Monocular depth scale can be badly off on some rooms (2.5× on one camera).
   The ground plane stays correct, but the occluder map does not.
-- The global stitcher is validated in `bench/` but is not yet wired into the
-  tracking pipeline, which still ships the greedy ghost-pool result.
+- The global stitcher is a post-pass: `scripts/stitch_traj.py` (also
+  `--stitch` on `track_rtdetr_db.py`). Live tracking still writes the greedy
+  ghost-pool IDs; identity is rewritten when the clip ends. The demo is that
+  contrast — greedy mixing two people, stitch recovering the split.
 - Stature was tested as an identity cue and **rejected** (AUC 0.574): human
   stature spread is ~0.07 m against 0.12–0.24 m of instrument noise. See
   REPORT §12 before trying it again.

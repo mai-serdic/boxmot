@@ -41,6 +41,16 @@ from reid.reachability import Reachability, ReachParams
 from reid.scene_geometry import GroundPlane
 from reid.scene_depth import SceneModel, floor_from_boxes
 from reid.floor_plan import FloorPlan
+from reid.trajectory_stitch import (
+    Tracklet,
+    number_unassigned_tracklets,
+    path_frames_from_traj,
+    run_stitch,
+)
+from reid.room_memory import RoomMemory, stitch_memory_groups, groups_from_memory
+from reid.crossing_events import detect_crossing_events, unresolved_crossings
+from reid.joint_crossing import apply_crossing_resolutions, named_path_identities
+from reid.occupancy_partition import bipartite_room_partition
 # face_anchor is imported lazily in run() — insightface is only needed with --face
 
 
@@ -64,7 +74,9 @@ class RTDetrOnnx:
         self.input_name = self.session.get_inputs()[0].name
         self.size_name = self.session.get_inputs()[1].name
 
-    def predict(self, frame_bgr: np.ndarray, conf_thresh: float = 0.4, person_class: int = 0):
+    def predict(
+        self, frame_bgr: np.ndarray, conf_thresh: float = 0.4, person_class: int = 0
+    ):
         orig_h, orig_w = frame_bgr.shape[:2]
         h, w = self.INPUT_SIZE
 
@@ -105,12 +117,12 @@ def suppress_contained(dets: np.ndarray, thresh: float) -> np.ndarray:
         return dets
     b = dets[:, :4]
     area = np.maximum(b[:, 2] - b[:, 0], 0) * np.maximum(b[:, 3] - b[:, 1], 0)
-    order = np.argsort(-area)                      # keep the larger box
+    order = np.argsort(-area)  # keep the larger box
     keep = np.ones(len(dets), bool)
     for ii, i in enumerate(order):
         if not keep[i]:
             continue
-        for j in order[ii + 1:]:
+        for j in order[ii + 1 :]:
             if not keep[j] or area[j] <= 0:
                 continue
             iw = max(0.0, min(b[i, 2], b[j, 2]) - max(b[i, 0], b[j, 0]))
@@ -138,6 +150,8 @@ def run(args):
 
     # ── 1. Detector ──────────────────────────────────────────────────────────
     pid_frames: dict = {}
+    raw_traj: dict[int, list] = {}
+    trk_embs: dict[int, np.ndarray] = {}
     n_suppressed = 0
 
     print(f"[INFO] Loading ONNX detector: {args.onnx}")
@@ -148,7 +162,9 @@ def run(args):
     if not reid_path.is_absolute():
         reid_path = PROJECT_ROOT / args.reid
     print(f"[INFO] Loading ReID model: {reid_path}")
-    reid_backend = ReID(weights=reid_path, device=torch_device, half=False).get_backend()
+    reid_backend = ReID(
+        weights=reid_path, device=torch_device, half=False
+    ).get_backend()
 
     # ── 3. Video I/O ─────────────────────────────────────────────────────────
     cap = cv2.VideoCapture(args.input)
@@ -161,15 +177,20 @@ def run(args):
     print(f"[INFO] Video {orig_w}x{orig_h} @ {fps:.1f} fps  ({total} frames)")
 
     # ── 4. Tracker (short-term) ──────────────────────────────────────────────
+    tracker_buffer = (
+        args.tracker_buffer
+        if args.tracker_buffer is not None
+        else int(round(args.tracker_buffer_seconds * fps))
+    )
     tracker = BotSort(
         reid_model=reid_backend,
-        track_high_thresh=0.5,
-        track_low_thresh=0.1,
-        new_track_thresh=0.7,
-        track_buffer=600,
-        match_thresh=0.8,
-        proximity_thresh=0.9,
-        appearance_thresh=0.4,
+        track_high_thresh=args.tracker_high_thresh,
+        track_low_thresh=args.tracker_low_thresh,
+        new_track_thresh=args.tracker_new_thresh,
+        track_buffer=tracker_buffer,
+        match_thresh=args.tracker_match_thresh,
+        proximity_thresh=args.tracker_proximity_thresh,
+        appearance_thresh=args.tracker_appearance_thresh,
         cmc_method="ecc",
         frame_rate=int(round(fps)),
         with_reid=True,
@@ -240,15 +261,19 @@ def run(args):
                 print(f"[INFO] Reachability loaded from {_cache}")
             else:
                 reach = Reachability.build(_sc)
-                print("[INFO] Reachability built from depth only "
-                      "(will sharpen as feet are observed)")
+                print(
+                    "[INFO] Reachability built from depth only "
+                    "(will sharpen as feet are observed)"
+                )
             # A hand-drawn plan overrides the depth-derived tiers. On a big
             # room the monocular depth is not good enough to separate floor
             # from furniture (office_cam1: 152 cm of error on known floor,
             # against a 20 cm threshold), which leaves ~89% of the map UNKNOWN
             # and the geodesic prior with nothing to say. Two minutes of
             # drawing replaces that with a real boundary.
-            _fp = Path(args.floor_plan) if args.floor_plan else _sdir / "floor_plan.json"
+            _fp = (
+                Path(args.floor_plan) if args.floor_plan else _sdir / "floor_plan.json"
+            )
             if args.floor_plan or _fp.exists():
                 if not _fp.exists():
                     sys.exit(f"--floor-plan {_fp} does not exist")
@@ -261,14 +286,19 @@ def run(args):
                 print(f"[INFO] floor plan applied from {_fp}")
                 for i, ht in enumerate(_plan.obstacle_heights(_sc)):
                     if ht["cls"] == "unseen":
-                        print(f"[INFO]   blocked polygon {i}: depth never saw this cell "
-                              f"({ht['n_cells']} cells) -- height unknown")
+                        print(
+                            f"[INFO]   blocked polygon {i}: depth never saw this cell "
+                            f"({ht['n_cells']} cells) -- height unknown"
+                        )
                     else:
-                        print(f"[INFO]   blocked polygon {i}: {ht['cls']}  "
-                              f"(p50={ht['height_p50_m']:.2f}m p90={ht['height_p90_m']:.2f}m "
-                              f"max={ht['height_max_m']:.2f}m, {ht['n_seen']}/{ht['n_cells']} cells seen)")
-            reach_params = ReachParams(v_max=args.ghost_vmax,
-                                       slack_m=args.ghost_reach_slack)
+                        print(
+                            f"[INFO]   blocked polygon {i}: {ht['cls']}  "
+                            f"(p50={ht['height_p50_m']:.2f}m p90={ht['height_p90_m']:.2f}m "
+                            f"max={ht['height_max_m']:.2f}m, {ht['n_seen']}/{ht['n_cells']} cells seen)"
+                        )
+            reach_params = ReachParams(
+                v_max=args.ghost_vmax, slack_m=args.ghost_reach_slack
+            )
             print(f"[INFO] {reach.summary()}  v_max={args.ghost_vmax} m/s")
             scene_gp, scene_model, reach_cache = _gp, _sc, _cache
         ghost_pool = GhostPool(
@@ -291,14 +321,19 @@ def run(args):
 
     # ── 6. Output writer ─────────────────────────────────────────────────────
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    writer = cv2.VideoWriter(
-        args.output, cv2.VideoWriter_fourcc(*"mp4v"), fps, (orig_w, orig_h)
+    writer = (
+        None
+        if args.no_video
+        else cv2.VideoWriter(
+            args.output, cv2.VideoWriter_fourcc(*"mp4v"), fps, (orig_w, orig_h)
+        )
     )
 
     # ── 7. Main loop ────────────────────────────────────────────────────────
     print("[INFO] Tracking with persistent person DB …")
     frame_idx = 0
     frame_shape = (orig_h, orig_w, 3)
+    stitch_payload = None
     try:
         while True:
             ret, frame = cap.read()
@@ -356,17 +391,19 @@ def run(args):
                     # the most-recent (which is often a back-view at the
                     # moment of disappearance).
                     bank_embs = [emb for emb, _q in st["bank"]]
-                    ghost_pool.add(GhostTrack(
-                        trk_id=dead_id,
-                        last_frame=frame_idx - 1,
-                        last_bbox=st["last_bbox"],
-                        last_velocity=st["last_velocity"],
-                        embeddings=bank_embs,
-                        avg_height=st["height_sum"] / st["n_obs"],
-                        avg_width=st["width_sum"] / st["n_obs"],
-                        last_xy=st.get("last_xy"),
-                        last_vel_xy=st.get("last_vel_xy"),
-                    ))
+                    ghost_pool.add(
+                        GhostTrack(
+                            trk_id=dead_id,
+                            last_frame=frame_idx - 1,
+                            last_bbox=st["last_bbox"],
+                            last_velocity=st["last_velocity"],
+                            embeddings=bank_embs,
+                            avg_height=st["height_sum"] / st["n_obs"],
+                            avg_width=st["width_sum"] / st["n_obs"],
+                            last_xy=st.get("last_xy"),
+                            last_vel_xy=st.get("last_vel_xy"),
+                        )
+                    )
 
                 bound_ghost_ids: set[int] = set()
                 for t in tracks:
@@ -393,8 +430,10 @@ def run(args):
                     emb_v = np.asarray(embs[det_ind], dtype=np.float32).reshape(-1)
                     emb_v = emb_v / (np.linalg.norm(emb_v) + 1e-12)
                     info = NewTrackInfo(
-                        bbox=(x1, y1, x2, y2), embedding=emb_v,
-                        height=float(y2 - y1), width=float(x2 - x1),
+                        bbox=(x1, y1, x2, y2),
+                        embedding=emb_v,
+                        height=float(y2 - y1),
+                        width=float(x2 - x1),
                         xy=trk_xy.get(trk_id),
                     )
                     match = ghost_pool.best_match(
@@ -420,14 +459,17 @@ def run(args):
                     # this freshly-born trk_id, so resolver continues with
                     # the same Person_XXX assignment.
                     if ghost_id in resolver.trk_to_person:
-                        resolver.trk_to_person[trk_id] = \
-                            resolver.trk_to_person.pop(ghost_id)
+                        resolver.trk_to_person[trk_id] = resolver.trk_to_person.pop(
+                            ghost_id
+                        )
                         if ghost_id in resolver.last_update_frame:
-                            resolver.last_update_frame[trk_id] = \
+                            resolver.last_update_frame[trk_id] = (
                                 resolver.last_update_frame.pop(ghost_id)
+                            )
                         if ghost_id in resolver.last_match_dist:
-                            resolver.last_match_dist[trk_id] = \
+                            resolver.last_match_dist[trk_id] = (
                                 resolver.last_match_dist.pop(ghost_id)
+                            )
                     print(
                         f"  [GHOST] frame={frame_idx} new trk={trk_id} → "
                         f"rebind lost trk={ghost_id}  "
@@ -442,7 +484,8 @@ def run(args):
             # cannot resolve to one of these — that would put two boxes with
             # the same label on screen at once.
             in_use_pids: set[int] = {
-                pid for tid, pid in resolver.trk_to_person.items()
+                pid
+                for tid, pid in resolver.trk_to_person.items()
                 if tid in active_trk_ids
             }
 
@@ -455,6 +498,9 @@ def run(args):
                 trk_id = int(t[4])
                 conf = float(t[5])
                 det_ind = int(t[7])
+                raw_traj.setdefault(trk_id, []).append(
+                    [int(frame_idx), int(x1), int(y1), int(x2), int(y2)]
+                )
 
                 if det_ind < 0 or det_ind >= len(embs):
                     pid = resolver.trk_to_person.get(trk_id)
@@ -469,7 +515,7 @@ def run(args):
                         and (y2 - y1) >= args.face_min_track_h
                     ):
                         cx1, cy1 = max(0, x1), max(0, y1)
-                        crop = clean_frame[cy1:max(cy1, y2), cx1:max(cx1, x2)]
+                        crop = clean_frame[cy1 : max(cy1, y2), cx1 : max(cx1, x2)]
                         face_obs = face_anchor.extract(crop)
 
                     # Exclude pids in use by *other* trks; this trk's own pid
@@ -502,9 +548,7 @@ def run(args):
                     # Big ID, sized with the box so distant people don't get a
                     # label that covers their neighbours.
                     label = str(pid)
-                    fs = float(
-                        min(max((y2 - y1) / 190.0, 1.0), 3.2)
-                    ) * args.id_scale
+                    fs = float(min(max((y2 - y1) / 190.0, 1.0), 3.2)) * args.id_scale
                     thk = max(2, int(round(fs * 2.6)))
                     (tw, th), _ = cv2.getTextSize(
                         label, cv2.FONT_HERSHEY_SIMPLEX, fs, thk
@@ -512,16 +556,31 @@ def run(args):
                     tx = int(min(max((x1 + x2) // 2 - tw // 2, 2), orig_w - tw - 2))
                     ty = y1 - 10 if y1 - 10 - th > 0 else min(y2 + th + 8, orig_h - 4)
                     cv2.rectangle(
-                        frame, (tx - 6, ty - th - 8), (tx + tw + 6, ty + 8),
-                        (15, 15, 15), -1,
+                        frame,
+                        (tx - 6, ty - th - 8),
+                        (tx + tw + 6, ty + 8),
+                        (15, 15, 15),
+                        -1,
                     )
                     cv2.putText(
-                        frame, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, fs,
-                        (0, 0, 0), thk + 4, cv2.LINE_AA,
+                        frame,
+                        label,
+                        (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        fs,
+                        (0, 0, 0),
+                        thk + 4,
+                        cv2.LINE_AA,
                     )
                     cv2.putText(
-                        frame, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, fs,
-                        color, thk, cv2.LINE_AA,
+                        frame,
+                        label,
+                        (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        fs,
+                        color,
+                        thk,
+                        cv2.LINE_AA,
                     )
                 else:
                     # Unresolved track: gray bbox only, no label.
@@ -541,8 +600,14 @@ def run(args):
                 )
             cv2.rectangle(frame, (0, 0), (orig_w, 28), (0, 0, 0), -1)
             cv2.putText(
-                frame, hud, (8, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA,
+                frame,
+                hud,
+                (8, 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
             )
 
             # ── GHOST POOL: update per-track rolling state for next frame ──
@@ -559,7 +624,7 @@ def run(args):
             if ghost_pool is not None:
                 BANK_K = 10
                 BANK_WARMUP_FRAMES = 3
-                BANK_CONSISTENCY_MAX = 0.30   # cosine distance gate
+                BANK_CONSISTENCY_MAX = 0.30  # cosine distance gate
 
                 def _bank_add(bank: list, emb: np.ndarray, q: float, k: int) -> None:
                     if len(bank) < k:
@@ -587,7 +652,7 @@ def run(args):
                         st = {
                             "last_bbox": bbox_t,
                             "last_velocity": (0.0, 0.0),
-                            "bank": [],                # K-best (emb, quality)
+                            "bank": [],  # K-best (emb, quality)
                             "n_obs": 1,
                             "height_sum": float(y2 - y1),
                             "width_sum": float(x2 - x1),
@@ -617,8 +682,10 @@ def run(args):
                                 vx = (xy_now[0] - xy_prev[0]) * fps
                                 vy = (xy_now[1] - xy_prev[1]) * fps
                                 pv = st.get("last_vel_xy") or (0.0, 0.0)
-                                st["last_vel_xy"] = (a * vx + (1 - a) * pv[0],
-                                                     a * vy + (1 - a) * pv[1])
+                                st["last_vel_xy"] = (
+                                    a * vx + (1 - a) * pv[0],
+                                    a * vy + (1 - a) * pv[1],
+                                )
                             st["last_xy"] = xy_now
                         st["last_bbox"] = bbox_t
                         st["n_obs"] += 1
@@ -642,17 +709,22 @@ def run(args):
                                     # likely view change — skip without poisoning
                                     continue
                         _bank_add(bank, e, q, BANK_K)
+                        c = _bank_centroid(bank)
+                        if c is not None:
+                            trk_embs[trk_id] = c.astype(np.float32)
 
                 prev_active_trk_ids = active_trk_ids
 
-            writer.write(frame)
+            if writer is not None:
+                writer.write(frame)
             frame_idx += 1
             if frame_idx % 100 == 0:
                 pct = frame_idx / total * 100 if total else 0
                 ghost_stat = (
                     f" ghost={len(ghost_pool)} rebound={ghost_pool.n_rebound}"
                     f" reachveto={ghost_pool.n_reach_veto}"
-                    if ghost_pool is not None else ""
+                    if ghost_pool is not None
+                    else ""
                 )
                 print(
                     f"  frame {frame_idx}/{total} ({pct:.1f}%)  "
@@ -662,8 +734,226 @@ def run(args):
                 )
     finally:
         cap.release()
-        writer.release()
-        db.save()
+        if writer is not None:
+            writer.release()
+        if not args.read_only_gallery:
+            db.save()
+        # Stitch while `reach` still has the floor-plan stamp. The auto map
+        # is restored just below so the cache does not bake the drawing in.
+        if args.stitch and reach is not None and raw_traj:
+            tl = []
+            for tid, rows in raw_traj.items():
+                a = np.asarray(rows, float)
+                if len(a) < args.stitch_min_obs:
+                    continue
+                xy, _vis = floor_from_boxes(scene_gp, scene_model, a[:, 1:5])
+                emb = trk_embs.get(tid)
+                tl.append(Tracklet(int(tid), a[:, 0].astype(int), xy, emb=emb))
+            w_emb = args.stitch_w_emb
+            stitched = run_stitch(
+                reach,
+                tl,
+                fps,
+                reach_params,
+                w_emb=w_emb,
+                birth_cost=args.stitch_birth,
+            )
+            pf = path_frames_from_traj(
+                raw_traj, stitched["owner_path"], unassigned_id=0
+            )
+            stitch_payload = {
+                "W": orig_w,
+                "H": orig_h,
+                "frames": frame_idx,
+                "fps": fps,
+                "identity": "path_through_space",
+                "w_emb": w_emb,
+                "birth_cost": stitched["birth_cost"],
+                "suggest": stitched["suggest"],
+                "max_simultaneous": stitched["max_simultaneous"],
+                "n_raw": stitched["n_raw"],
+                "n_greedy": stitched["n_greedy"],
+                "n_path": stitched["n_path"],
+                "groups_path": {str(k): v for k, v in stitched["groups_path"].items()},
+                "owner_path": {
+                    str(k): int(v) for k, v in stitched["owner_path"].items()
+                },
+                "owner_trk": {str(k): int(v) for k, v in stitched["owner"].items()},
+                "path_frames": {str(k): v for k, v in sorted(pf.items())},
+                "unassigned_tracklets": sorted(
+                    int(tid)
+                    for tid in raw_traj
+                    if int(tid) not in stitched["owner_path"]
+                ),
+                "path_identity": {
+                    str(pid): {
+                        "person_id": None,
+                        "status": "unresolved",
+                        "confidence": 0.0,
+                        "evidence": [],
+                    }
+                    for pid in sorted(stitched["groups_path"])
+                },
+            }
+            crossing_events = detect_crossing_events(raw_traj)
+            stitch_payload["crossing_events"] = [e.__dict__ for e in crossing_events]
+            stitch_payload["uncertain_events"] = unresolved_crossings(crossing_events)
+            if args.stitch_room_memory:
+                memory = RoomMemory(
+                    reach,
+                    fps,
+                    reach_params,
+                    min_link_prob=args.room_memory_min_link,
+                    batch_window_frames=args.room_memory_batch_frames,
+                )
+                mem_owner = memory.observe(tl)
+                mem_states = memory.snapshot()
+                mem_global = stitch_memory_groups(
+                    reach,
+                    tl,
+                    mem_owner,
+                    fps,
+                    reach_params,
+                    birth_cost=args.room_memory_global_birth,
+                )
+                mem_global, short_fragments = number_unassigned_tracklets(
+                    mem_global, raw_traj
+                )
+                mem_pf = path_frames_from_traj(raw_traj, mem_global, unassigned_id=0)
+                stitch_payload.update(
+                    {
+                        "room_memory_owner": {
+                            str(k): int(v) for k, v in mem_owner.items()
+                        },
+                        "room_memory_global_owner": {
+                            str(k): int(v) for k, v in mem_global.items()
+                        },
+                        "room_memory_global_groups": {
+                            str(k): v for k, v in groups_from_memory(mem_global).items()
+                        },
+                        "short_fragment_tracklets": short_fragments,
+                        "room_path_frames": {
+                            str(k): v for k, v in sorted(mem_pf.items())
+                        },
+                        "path_states": {str(k): v for k, v in mem_states.items()},
+                        "room_path_identity": {
+                            str(pid): {
+                                "person_id": None,
+                                "status": "unresolved",
+                                "confidence": 0.0,
+                                "evidence": [],
+                            }
+                            for pid in sorted(set(mem_global.values()))
+                        },
+                    }
+                )
+                stitch_payload.update(
+                    {
+                        "baseline_owner_path": stitch_payload["owner_path"],
+                        "baseline_groups_path": stitch_payload["groups_path"],
+                        "baseline_path_frames": stitch_payload["path_frames"],
+                        "owner_path": stitch_payload["room_memory_global_owner"],
+                        "groups_path": stitch_payload["room_memory_global_groups"],
+                        "path_frames": stitch_payload["room_path_frames"],
+                        "n_path": len(stitch_payload["room_memory_global_groups"]),
+                        "path_identity": stitch_payload["room_path_identity"],
+                        "unassigned_tracklets": [],
+                    }
+                )
+            if args.stitch_occupancy_partition:
+                primary_owner = {
+                    int(k): int(v) for k, v in stitch_payload["owner_path"].items()
+                }
+                partition_owner, partition_diagnostic = bipartite_room_partition(
+                    raw_traj, primary_owner
+                )
+                stitch_payload["occupancy_partition"] = partition_diagnostic
+                if partition_diagnostic["status"] == "applied":
+                    stitch_payload["pre_occupancy_owner_path"] = stitch_payload[
+                        "owner_path"
+                    ]
+                    stitch_payload["pre_occupancy_groups_path"] = stitch_payload[
+                        "groups_path"
+                    ]
+                    stitch_payload["pre_occupancy_path_frames"] = stitch_payload[
+                        "path_frames"
+                    ]
+                    partition_groups = groups_from_memory(partition_owner)
+                    partition_pf = path_frames_from_traj(
+                        raw_traj, partition_owner, compact=False, unassigned_id=0
+                    )
+                    stitch_payload["owner_path"] = {
+                        str(k): int(v) for k, v in partition_owner.items()
+                    }
+                    stitch_payload["groups_path"] = {
+                        str(k): v for k, v in partition_groups.items()
+                    }
+                    stitch_payload["path_frames"] = {
+                        str(k): v for k, v in sorted(partition_pf.items())
+                    }
+                    stitch_payload["n_path"] = len(partition_groups)
+                    stitch_payload["path_identity"] = {
+                        str(path_id): {
+                            "person_id": None,
+                            "status": "unresolved",
+                            "confidence": 0.0,
+                            "evidence": [],
+                        }
+                        for path_id in sorted(partition_groups)
+                    }
+            if args.crossing_resolutions:
+                import json as _json
+
+                resolution_path = Path(args.crossing_resolutions)
+                resolution_doc = _json.loads(resolution_path.read_text())
+                primary_owner = {
+                    int(k): int(v) for k, v in stitch_payload["owner_path"].items()
+                }
+                frame_owner, applied, resolved, bindings = apply_crossing_resolutions(
+                    crossing_events,
+                    raw_traj,
+                    primary_owner,
+                    resolution_doc,
+                    include_bindings=True,
+                )
+                corrected_pf = path_frames_from_traj(
+                    raw_traj,
+                    primary_owner,
+                    compact=False,
+                    unassigned_id=0,
+                    frame_owner=frame_owner,
+                )
+                stitch_payload["path_frames"] = {
+                    str(k): v for k, v in sorted(corrected_pf.items())
+                }
+                if "room_path_frames" in stitch_payload:
+                    stitch_payload["room_path_frames"] = stitch_payload["path_frames"]
+                stitch_payload["crossing_resolution_source"] = str(resolution_path)
+                stitch_payload["crossing_resolutions_applied"] = applied
+                stitch_payload["reviewed_path_labels"] = {
+                    label: int(path_id) for label, path_id in bindings.items()
+                }
+                stitch_payload["path_identity"].update(
+                    named_path_identities(bindings, resolution_doc)
+                )
+                stitch_payload["uncertain_events"] = [
+                    item
+                    for item in stitch_payload["uncertain_events"]
+                    if item["event_id"] not in resolved
+                ]
+                print(
+                    f"[INFO] applied {len(applied)} authoritative crossing "
+                    f"resolutions to {len(frame_owner)} observations; "
+                    f"{len(resolved)} events closed"
+                )
+            print(
+                f"[DONE] stitch raw={stitched['n_raw']} "
+                f"greedy={stitched['n_greedy']} "
+                f"path={stitch_payload['n_path']} "
+                f"birth={stitched['birth_cost']:.2f} w_emb={w_emb}"
+            )
+        elif args.stitch and reach is None:
+            print("[WARN] --stitch needs --scene; skipped")
         # Persist what this run learned about where the floor actually is, so
         # the next run on this camera starts with a sharper map. This is the
         # whole no-annotation story: the site commissions itself by being
@@ -671,6 +961,7 @@ def run(args):
         if reach is not None and reach_cache is not None:
             if reach_auto_tier is not None:
                 from reid.reachability import FREE, MIN_FOOT_OBS
+
                 _saved = reach_auto_tier.copy()
                 _saved[reach.foot_obs >= MIN_FOOT_OBS] = FREE
                 reach.tier = _saved
@@ -681,28 +972,81 @@ def run(args):
 
     if args.dump_json:
         import json as _json
+
         Path(args.dump_json).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.dump_json).write_text(_json.dumps(
-            {"W": orig_w, "H": orig_h, "frames": frame_idx,
-             "pid_frames": {str(k): v for k, v in sorted(pid_frames.items())}}))
-        print(f"[DONE] Saved per-frame person IDs: {args.dump_json}")
+        payload = {
+            "W": orig_w,
+            "H": orig_h,
+            "frames": frame_idx,
+            "fps": fps,
+            "traj": {str(k): v for k, v in sorted(raw_traj.items())},
+            "trk_embs": {str(k): v.tolist() for k, v in sorted(trk_embs.items())},
+            "pid_frames": {str(k): v for k, v in sorted(pid_frames.items())},
+        }
+        if stitch_payload is not None:
+            payload["path_frames"] = stitch_payload["path_frames"]
+            payload["owner_path"] = stitch_payload["owner_path"]
+            payload["groups_path"] = stitch_payload["groups_path"]
+            payload["n_path"] = stitch_payload["n_path"]
+            payload["unassigned_tracklets"] = stitch_payload["unassigned_tracklets"]
+            payload["path_identity"] = stitch_payload["path_identity"]
+            for key in (
+                "room_memory_owner",
+                "room_memory_global_owner",
+                "room_memory_global_groups",
+                "room_path_frames",
+                "path_states",
+                "room_path_identity",
+                "baseline_owner_path",
+                "baseline_groups_path",
+                "baseline_path_frames",
+                "crossing_resolution_source",
+                "crossing_resolutions_applied",
+                "reviewed_path_labels",
+                "occupancy_partition",
+                "pre_occupancy_owner_path",
+                "pre_occupancy_groups_path",
+                "pre_occupancy_path_frames",
+                "short_fragment_tracklets",
+            ):
+                if key in stitch_payload:
+                    payload[key] = stitch_payload[key]
+            payload["crossing_events"] = stitch_payload["crossing_events"]
+            payload["uncertain_events"] = stitch_payload["uncertain_events"]
+        Path(args.dump_json).write_text(_json.dumps(payload))
+        print(f"[DONE] Saved tracklets + path/gallery IDs: {args.dump_json}")
+        if stitch_payload is not None:
+            stitch_path = Path(args.dump_json).with_name(
+                Path(args.dump_json).stem + "_stitched.json"
+            )
+            stitch_path.write_text(_json.dumps(stitch_payload, indent=2))
+            print(f"[DONE] stitch -> {stitch_path}")
+    elif stitch_payload is not None:
+        print(
+            f"[DONE] stitch groups_path={stitch_payload['groups_path']} "
+            f"(pass --dump-json to write them)"
+        )
 
-    print(f"[DONE] Suppressed {n_suppressed} contained detections "
-          f"(thresh={args.contain_thresh})")
+    print(
+        f"[DONE] Suppressed {n_suppressed} contained detections "
+        f"(thresh={args.contain_thresh})"
+    )
 
-    print(f"\n[DONE] Saved video: {args.output}")
+    if writer is not None:
+        print(f"\n[DONE] Saved video: {args.output}")
     print(
         f"[DONE] DB final state: {db.n_persons} persons, "
         f"{db.n_embeddings} embeddings  ({db.db_path})"
     )
 
-    fixed = args.output.replace(".mp4", "_h264.mp4")
-    os.system(
-        f'ffmpeg -y -i "{args.output}" -vcodec libx264 -crf 23 "{fixed}" '
-        f'-loglevel quiet'
-    )
-    if os.path.exists(fixed):
-        print(f"[DONE] H.264 copy: {fixed}")
+    if writer is not None:
+        fixed = args.output.replace(".mp4", "_h264.mp4")
+        os.system(
+            f'ffmpeg -y -i "{args.output}" -vcodec libx264 -crf 23 "{fixed}" '
+            f"-loglevel quiet"
+        )
+        if os.path.exists(fixed):
+            print(f"[DONE] H.264 copy: {fixed}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -718,131 +1062,261 @@ if __name__ == "__main__":
     p.add_argument("--reid", default="models/clip_market1501.pt")
     p.add_argument("--input", default="videos/gunsan_test.mp4")
     p.add_argument("--output", default="runs/track/rtdetr_db.mp4")
+    p.add_argument(
+        "--no-video",
+        action="store_true",
+        help="skip rendered video and H.264 conversion during benchmarks",
+    )
     p.add_argument("--gallery", default="gallery/persons.npz")
-    p.add_argument("--contain-thresh", type=float, default=0.9,
-                   help="drop a detection this fraction contained inside a "
-                        "larger one (0 disables)")
-    p.add_argument("--id-scale", type=float, default=1.0,
-                   help="multiplier on the on-screen person-ID text size")
-    p.add_argument("--dump-json", default=None,
-                   help="write per-frame resolved person IDs + boxes here")
+    p.add_argument(
+        "--read-only-gallery",
+        action="store_true",
+        help="do not persist enrolments/updates (safe benchmark mode)",
+    )
+    p.add_argument(
+        "--contain-thresh",
+        type=float,
+        default=0.9,
+        help="drop a detection this fraction contained inside a "
+        "larger one (0 disables)",
+    )
+    p.add_argument(
+        "--id-scale",
+        type=float,
+        default=1.0,
+        help="multiplier on the on-screen person-ID text size",
+    )
+    p.add_argument(
+        "--dump-json",
+        default=None,
+        help="write raw tracklets (traj) + per-frame person IDs",
+    )
+    p.add_argument(
+        "--stitch",
+        action="store_true",
+        help="after the clip, rewrite IDs with the global min-cost-flow "
+        "stitcher (needs --scene). Writes <dump-json>_stitched.json",
+    )
+    p.add_argument(
+        "--stitch-birth",
+        type=float,
+        default=None,
+        help="birth_cost for the stitcher; omit to derive it from the "
+        "observed link-probability distribution",
+    )
+    p.add_argument(
+        "--stitch-room-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="use persistent room-memory paths and global revision",
+    )
+    p.add_argument("--room-memory-min-link", type=float, default=0.18)
+    p.add_argument("--room-memory-batch-frames", type=int, default=20)
+    p.add_argument("--room-memory-global-birth", type=float, default=6.0)
+    p.add_argument(
+        "--stitch-min-obs",
+        type=int,
+        default=10,
+        help="minimum observations admitted to core stitching; shorter fragments are numbered afterward",
+    )
+    p.add_argument(
+        "--stitch-occupancy-partition",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="collapse fragments only for a proven bipartite co-presence graph",
+    )
+    p.add_argument(
+        "--crossing-resolutions",
+        default=None,
+        help="authoritative reviewed crossing-state JSON applied after stitching",
+    )
+    p.add_argument(
+        "--stitch-w-emb",
+        type=float,
+        default=0.0,
+        help="optional appearance soft weight in stitch (default 0 = geometry only). "
+        "Cannot veto a feasible walk; only use to break ambiguous ties.",
+    )
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--conf", type=float, default=0.4)
     p.add_argument("--person-class", type=int, default=0)
+    p.add_argument("--tracker-high-thresh", type=float, default=0.5)
+    p.add_argument("--tracker-low-thresh", type=float, default=0.1)
+    p.add_argument("--tracker-new-thresh", type=float, default=0.7)
+    p.add_argument(
+        "--tracker-buffer",
+        type=int,
+        default=None,
+        help="stale-track lifetime in frames; overrides --tracker-buffer-seconds",
+    )
+    p.add_argument(
+        "--tracker-buffer-seconds",
+        type=float,
+        default=10.0,
+        help="camera-independent stale-track lifetime (measured default: 10 s)",
+    )
+    p.add_argument("--tracker-match-thresh", type=float, default=0.8)
+    p.add_argument("--tracker-proximity-thresh", type=float, default=0.9)
+    p.add_argument("--tracker-appearance-thresh", type=float, default=0.4)
     # DB / resolver knobs
     p.add_argument("--k-per-person", type=int, default=10)
     p.add_argument(
-        "--match-threshold", type=float, default=0.35,
+        "--match-threshold",
+        type=float,
+        default=0.35,
         help="cosine distance ceiling for declaring a match (lower = stricter). "
-             "0.25 was far too strict for CLIP on this footage — same-person "
-             "views median ~0.36 apart, so ~75%% of returning workers spawned a "
-             "new ID. 0.35 roughly halves that; the Lowe ratio test below keeps "
-             "merges controlled. Sweep 0.30-0.42 per site — see bench/REPORT.md.",
+        "0.25 was far too strict for CLIP on this footage — same-person "
+        "views median ~0.36 apart, so ~75%% of returning workers spawned a "
+        "new ID. 0.35 roughly halves that; the Lowe ratio test below keeps "
+        "merges controlled. Sweep 0.30-0.42 per site — see bench/REPORT.md.",
     )
     p.add_argument(
-        "--ratio-threshold", type=float, default=0.85,
+        "--ratio-threshold",
+        type=float,
+        default=0.85,
         help="Lowe-style ratio: best/second-best must be < this to commit a match",
     )
     p.add_argument(
-        "--gallery-update-max-dist", type=float, default=0.20,
+        "--gallery-update-max-dist",
+        type=float,
+        default=0.20,
         help="per-frame gallery updates are skipped if cur_dist > this",
     )
     p.add_argument("--decision-frames", type=int, default=8)
     p.add_argument("--quality-min-conf", type=float, default=0.7)
     # Ghost pool (within-session track-rebinding) knobs
     p.add_argument(
-        "--scene", type=str, default=None,
+        "--scene",
+        type=str,
+        default=None,
         help="commissioned calib dir (scene.json + scene_depth.npz) enabling "
-             "the geodesic walkable-floor prior for ghost rebinding",
+        "the geodesic walkable-floor prior for ghost rebinding",
     )
     p.add_argument(
-        "--floor-plan", type=str, default=None,
+        "--floor-plan",
+        type=str,
+        default=None,
         help="hand-drawn walkable/obstacle polygons from "
-             "scripts/annotate_floor.py; overrides the depth-derived walkable "
-             "map. Defaults to <scene>/floor_plan.json when that file exists",
+        "scripts/annotate_floor.py; overrides the depth-derived walkable "
+        "map. Defaults to <scene>/floor_plan.json when that file exists",
     )
     p.add_argument(
-        "--disable-geo-prior", action="store_true",
+        "--disable-geo-prior",
+        action="store_true",
         help="keep the legacy pixel-space Gaussian spatial prior even when "
-             "--scene is given (for A/B)",
+        "--scene is given (for A/B)",
     )
     p.add_argument(
-        "--ghost-vmax", type=float, default=2.2,
+        "--ghost-vmax",
+        type=float,
+        default=2.2,
         help="m/s walking-speed bound for the reachability veto",
     )
     p.add_argument(
-        "--ghost-reach-slack", type=float, default=0.6,
+        "--ghost-reach-slack",
+        type=float,
+        default=0.6,
         help="metres of localisation slack added to the reachability budget",
     )
     p.add_argument(
-        "--ghost-ttl-frames", type=int, default=9000,
+        "--ghost-ttl-frames",
+        type=int,
+        default=9000,
         help="how many frames a lost track stays rebind-eligible (default ~10min@15fps)",
     )
     p.add_argument(
-        "--ghost-threshold", type=float, default=0.55,
+        "--ghost-threshold",
+        type=float,
+        default=0.55,
         help="combined-signal score required to rebind a new track to a ghost",
     )
     p.add_argument(
-        "--ghost-emb-veto", type=float, default=0.55,
+        "--ghost-emb-veto",
+        type=float,
+        default=0.55,
         help="cosine distance above which embedding mismatch vetoes a rebind",
     )
     p.add_argument(
-        "--ghost-cross-id-emb-max", type=float, default=0.30,
+        "--ghost-cross-id-emb-max",
+        type=float,
+        default=0.30,
         help="cross-id rebinds (different trk_id) require emb_dist below this "
-             "tighter ceiling — prevents borderline matches from cascading the "
-             "wrong identity onto a different physical person",
+        "tighter ceiling — prevents borderline matches from cascading the "
+        "wrong identity onto a different physical person",
     )
     p.add_argument(
-        "--ghost-w-spatial", type=float, default=0.30,
+        "--ghost-w-spatial",
+        type=float,
+        default=0.30,
         help="ghost-pool score weight: spatial-prior (predicted position match)",
     )
     p.add_argument(
-        "--ghost-w-embedding", type=float, default=0.45,
+        "--ghost-w-embedding",
+        type=float,
+        default=0.45,
         help="ghost-pool score weight: body-embedding similarity",
     )
     p.add_argument(
-        "--ghost-w-time", type=float, default=0.10,
+        "--ghost-w-time",
+        type=float,
+        default=0.10,
         help="ghost-pool score weight: time-decay (younger ghosts preferred)",
     )
     p.add_argument(
-        "--ghost-w-height", type=float, default=0.10,
+        "--ghost-w-height",
+        type=float,
+        default=0.10,
         help="ghost-pool score weight: bbox-height consistency",
     )
     p.add_argument(
-        "--ghost-w-hat", type=float, default=0.05,
+        "--ghost-w-hat",
+        type=float,
+        default=0.05,
         help="ghost-pool score weight: hat-color match (auxiliary)",
     )
     p.add_argument(
-        "--disable-ghost-pool", action="store_true",
+        "--disable-ghost-pool",
+        action="store_true",
         help="turn off ghost-pool rebinding (baseline comparison)",
     )
     # Face anchoring (clothing-independent identity cue) knobs
     p.add_argument(
-        "--face", action="store_true",
+        "--face",
+        action="store_true",
         help="enable pose-gated face anchoring (confirm-only: a strict face "
-             "match decides/corrects identity; a face mismatch never blocks a "
-             "body match — see bench/05_eval_face_anchor.py)",
+        "match decides/corrects identity; a face mismatch never blocks a "
+        "body match — see bench/05_eval_face_anchor.py)",
     )
     p.add_argument(
-        "--face-tau", type=float, default=0.50,
+        "--face-tau",
+        type=float,
+        default=0.50,
         help="ArcFace cosine-distance ceiling for a face match. Kept well "
-             "below the face EER point (~0.70) because face matches override "
-             "body appearance and must be merge-safe",
+        "below the face EER point (~0.70) because face matches override "
+        "body appearance and must be merge-safe",
     )
     p.add_argument(
-        "--face-det-min", type=float, default=0.5,
+        "--face-det-min",
+        type=float,
+        default=0.5,
         help="min SCRFD detection confidence for the pose gate",
     )
     p.add_argument(
-        "--face-min-px", type=float, default=24.0,
+        "--face-min-px",
+        type=float,
+        default=24.0,
         help="min face min-side in pixels for the pose gate",
     )
     p.add_argument(
-        "--face-every", type=int, default=3,
+        "--face-every",
+        type=int,
+        default=3,
         help="run face extraction on a track every N-th frame (cost throttle)",
     )
     p.add_argument(
-        "--face-min-track-h", type=int, default=100,
+        "--face-min-track-h",
+        type=int,
+        default=100,
         help="skip face extraction for person boxes shorter than this (px)",
     )
     args = p.parse_args()

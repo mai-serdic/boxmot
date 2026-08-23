@@ -37,6 +37,7 @@ geodesic prior, so the physical scene model is what holds the paths together.
 This is offline by construction - it needs the future to revise the past - so it
 is a post-pass over a recording, not a replacement for the online tracker.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -45,23 +46,23 @@ import numpy as np
 
 try:
     import networkx as nx
-except Exception:                                   # pragma: no cover
+except Exception:  # pragma: no cover
     nx = None
 
-OVERLAP_TOL_F = 20      # tracklets may overlap this much and still be the same
-                        # person: measured, these are tracker handovers where
-                        # the replacement track is spawned before the old dies
-P_MIN = 1e-3            # floor on link probability, keeps -log finite
-SCALE = 1000            # costs must be integral for the min-cost-flow solver
-COVER_REWARD = int(SCALE * 12.0)    # > SCALE * -log(P_MIN); see stitch_global
+OVERLAP_TOL_F = 20  # tracklets may overlap this much and still be the same
+# person: measured, these are tracker handovers where
+# the replacement track is spawned before the old dies
+P_MIN = 1e-3  # floor on link probability, keeps -log finite
+SCALE = 1000  # costs must be integral for the min-cost-flow solver
+COVER_REWARD = int(SCALE * 12.0)  # > SCALE * -log(P_MIN); see stitch_global
 
 
 @dataclass
 class Tracklet:
     tid: int
-    frames: np.ndarray          # (N,) ascending
-    xy: np.ndarray              # (N,2) metres, may contain NaN
-    emb: np.ndarray | None = None   # (D,) unit-norm mean embedding, optional
+    frames: np.ndarray  # (N,) ascending
+    xy: np.ndarray  # (N,2) metres, may contain NaN
+    emb: np.ndarray | None = None  # (D,) unit-norm mean embedding, optional
 
     @property
     def t0(self) -> int:
@@ -94,13 +95,14 @@ def _state(f, xy, i, fps, win, direction):
     return tuple(xy[i]), (float(-v[0]), float(-v[1]))
 
 
-def link_prob(reach, a: Tracklet, b: Tracklet, fps: float, params,
-              w_emb: float = 0.0) -> float:
+def link_prob(
+    reach, a: Tracklet, b: Tracklet, fps: float, params, w_emb: float = 0.0
+) -> float:
     """P(b continues a). 0 means the graph gets no edge at all."""
     from .reachability import rebind_prior
 
     if b.t0 <= a.t1 - OVERLAP_TOL_F:
-        return 0.0                      # too much overlap to be one body
+        return 0.0  # too much overlap to be one body
     xy_a, v_a = a.end_state(fps)
     xy_b, _ = b.start_state(fps)
     if xy_a is None or xy_b is None:
@@ -108,7 +110,7 @@ def link_prob(reach, a: Tracklet, b: Tracklet, fps: float, params,
     elapsed = max(b.t0 - a.t1, 1) / fps
     r = rebind_prior(reach, xy_a, v_a, xy_b, elapsed, params)
     if not r["feasible"]:
-        return 0.0                      # could not have walked there: no edge
+        return 0.0  # could not have walked there: no edge
     p = float(r["prior"])
     if w_emb > 0.0 and a.emb is not None and b.emb is not None:
         # Appearance enters as a soft multiplier only. Sections 10-12 measured
@@ -119,15 +121,17 @@ def link_prob(reach, a: Tracklet, b: Tracklet, fps: float, params,
     return max(p, 0.0)
 
 
-def stitch_greedy(reach, tracklets, fps=15.0, params=None, w_emb=0.0,
-                  thresh=0.25) -> dict[int, int]:
+def stitch_greedy(
+    reach, tracklets, fps=15.0, params=None, w_emb=0.0, thresh=0.25
+) -> dict[int, int]:
     """What the ghost pool effectively does: walk forward in time, attach each
     new tracklet to the best-scoring earlier one, never revise."""
     from .reachability import ReachParams
+
     params = params or ReachParams()
     ts = sorted(tracklets, key=lambda t: t.t0)
-    owner = {t.tid: t.tid for t in ts}          # tid -> identity id
-    tail = {t.tid: t for t in ts}               # identity -> its last tracklet
+    owner = {t.tid: t.tid for t in ts}  # tid -> identity id
+    tail = {t.tid: t for t in ts}  # identity -> its last tracklet
     for b in ts[1:]:
         best, best_p = None, thresh
         for ident, a in list(tail.items()):
@@ -144,8 +148,9 @@ def stitch_greedy(reach, tracklets, fps=15.0, params=None, w_emb=0.0,
     return owner
 
 
-def stitch_global(reach, tracklets, fps=15.0, params=None, w_emb=0.0,
-                  birth_cost=2.0) -> dict[int, int]:
+def stitch_global(
+    reach, tracklets, fps=15.0, params=None, w_emb=0.0, birth_cost=2.0
+) -> dict[int, int]:
     """Min-cost flow over the tracklet graph: each unit of flow is one person.
 
     `birth_cost` is what it costs to declare a new identity. Raising it merges
@@ -154,6 +159,7 @@ def stitch_global(reach, tracklets, fps=15.0, params=None, w_emb=0.0,
     a new person.
     """
     from .reachability import ReachParams
+
     if nx is None:
         raise RuntimeError("networkx is required for global stitching")
     params = params or ReachParams()
@@ -162,7 +168,8 @@ def stitch_global(reach, tracklets, fps=15.0, params=None, w_emb=0.0,
         return {}
 
     G = nx.DiGraph()
-    G.add_node("SRC"); G.add_node("SNK")
+    G.add_node("SRC")
+    G.add_node("SNK")
     for t in ts:
         u, v = (t.tid, "i"), (t.tid, "o")
         # Capacity 1 across every tracklet: it belongs to exactly one person.
@@ -177,12 +184,16 @@ def stitch_global(reach, tracklets, fps=15.0, params=None, w_emb=0.0,
         G.add_edge(v, "SNK", capacity=1, weight=int(SCALE * birth_cost / 2))
     n_edge = 0
     for i, a in enumerate(ts):
-        for b in ts[i + 1:]:
+        for b in ts[i + 1 :]:
             p = link_prob(reach, a, b, fps, params, w_emb)
             if p <= 0.0:
                 continue
-            G.add_edge((a.tid, "o"), (b.tid, "i"), capacity=1,
-                       weight=int(SCALE * -np.log(max(p, P_MIN))))
+            G.add_edge(
+                (a.tid, "o"),
+                (b.tid, "i"),
+                capacity=1,
+                weight=int(SCALE * -np.log(max(p, P_MIN))),
+            )
             n_edge += 1
     if n_edge == 0:
         return {t.tid: t.tid for t in ts}
@@ -220,3 +231,168 @@ def stitch_global(reach, tracklets, fps=15.0, params=None, w_emb=0.0,
             if cur in seen:
                 break
     return owner
+
+
+def max_simultaneous(tracklets) -> int:
+    """Lower bound on identities: one person cannot be two boxes at once."""
+    ev = []
+    for t in tracklets:
+        ev.append((t.t0, 1))
+        ev.append((t.t1 + 1, -1))
+    ev.sort()
+    cur = mx = 0
+    for _, d in ev:
+        cur += d
+        mx = max(mx, cur)
+    return mx
+
+
+def pairwise_probs(reach, tracklets, fps, params, w_emb=0.0):
+    """Feasible (a.tid, b.tid, p) in time order. p = 0 pairs are omitted."""
+    ts = sorted(tracklets, key=lambda t: t.t0)
+    out = []
+    for i, a in enumerate(ts):
+        for b in ts[i + 1 :]:
+            p = link_prob(reach, a, b, fps, params, w_emb)
+            if p > 0.0:
+                out.append((a.tid, b.tid, float(p)))
+    return out
+
+
+def suggest_birth_cost(reach, tracklets, fps, params=None, w_emb=0.0):
+    """Pick `birth_cost` from occupancy and the prior's floor.
+
+    A true re-entry the geodesic cannot concentrate still scores `p_floor`
+    (~0.15, 1.9 nats). Connecting leftover fragments through those links is
+    what office_cam1 needed: at 4.0 the solver kept {2,4} and {3,6} apart
+    because the 2→3→4→6 path is three p_floor hops (~5.7 nats); at 6.0 it
+    takes the path and recovers the forced 2-colouring. gunsan plateaued
+    across 2–6, so a floor of 4 and a cap of 6 transfers. Cheap *best*
+    incomings are ignored as a knob — they can be impostors (1→6).
+    """
+    from .reachability import ReachParams
+
+    params = params or ReachParams()
+    pairs = pairwise_probs(reach, tracklets, fps, params, w_emb)
+    by_dst: dict[int, float] = {}
+    for _a, b, p in pairs:
+        by_dst[b] = max(by_dst.get(b, 0.0), p)
+    best_nats = [-np.log(max(p, P_MIN)) for p in by_dst.values()]
+    all_nats = [-np.log(max(p, P_MIN)) for _a, _b, p in pairs]
+    kmin = max_simultaneous(tracklets)
+    extra = max(len(tracklets) - kmin, 1)
+    p_floor_nats = float(-np.log(max(params.p_floor, P_MIN)))
+    hops = min(extra, 4)
+    bc = float(np.clip(hops * p_floor_nats, 4.0, 6.0))
+    p85 = float(np.percentile(best_nats, 85)) if best_nats else None
+    if p85 is not None and p85 > bc:
+        bc = float(np.clip(p85, 4.0, 6.0))
+    return bc, {
+        "n_feasible": len(pairs),
+        "n_with_pred": len(best_nats),
+        "best_nats_p50": float(np.median(best_nats)) if best_nats else None,
+        "best_nats_p85": p85,
+        "all_nats_p50": float(np.median(all_nats)) if all_nats else None,
+        "max_simultaneous": int(kmin),
+        "p_floor_nats": p_floor_nats,
+        "hops": int(hops),
+        "birth_cost": bc,
+    }
+
+
+def groups_from_owner(owner: dict[int, int]) -> dict[int, list[int]]:
+    g: dict[int, list[int]] = {}
+    for tid, ident in owner.items():
+        g.setdefault(ident, []).append(tid)
+    for v in g.values():
+        v.sort()
+    return dict(sorted(g.items(), key=lambda kv: kv[1][0]))
+
+
+def compact_path_ids(owner: dict[int, int]) -> dict[int, int]:
+    """Renumber path roots to 1..N in time order of first appearance."""
+    order = sorted(
+        set(owner.values()), key=lambda r: min(t for t, i in owner.items() if i == r)
+    )
+    remap = {old: i + 1 for i, old in enumerate(order)}
+    return {tid: remap[ident] for tid, ident in owner.items()}
+
+
+def number_unassigned_tracklets(owner, traj):
+    """Give filtered short fragments provisional paths without revising cores."""
+    completed = dict(owner)
+    missing = [int(tid) for tid in traj if int(tid) not in completed]
+
+    def first_frame(tid):
+        rows = traj.get(tid, traj.get(str(tid), []))
+        return min((int(row[0]) for row in rows), default=10**18)
+
+    next_path = max(completed.values(), default=0) + 1
+    for tid in sorted(missing, key=lambda value: (first_frame(value), value)):
+        completed[tid] = next_path
+        next_path += 1
+    return completed, sorted(missing)
+
+
+def path_frames_from_traj(
+    traj: dict,
+    owner: dict[int, int],
+    compact: bool = True,
+    unassigned_id: int | None = None,
+    frame_owner: dict[tuple[int, int], int] | None = None,
+) -> dict[int, list]:
+    """Per-frame boxes labelled by *path through space*, not gallery id.
+
+    `traj` maps tracklet id -> [[frame, x1, y1, x2, y2], ...].
+    `owner` maps tracklet id -> path root (from stitch_global).
+    """
+    frame_owner = frame_owner or {}
+    if compact:
+        original_owner = owner
+        owner = compact_path_ids(owner)
+        remap = {
+            original_path: owner[tid] for tid, original_path in original_owner.items()
+        }
+        unknown = sorted(set(frame_owner.values()) - set(remap))
+        if unknown:
+            raise ValueError(f"frame_owner references unknown paths: {unknown}")
+        frame_owner = {key: remap[path] for key, path in frame_owner.items()}
+    out: dict[int, list] = {}
+    for tid, rows in traj.items():
+        path_id = owner.get(
+            int(tid), int(tid) if unassigned_id is None else unassigned_id
+        )
+        for row in rows:
+            fi = int(row[0])
+            row_path = frame_owner.get((int(tid), fi), path_id)
+            out.setdefault(fi, []).append([row_path, *row[1:5]])
+    return out
+
+
+def run_stitch(reach, tracklets, fps, params=None, w_emb=0.0, birth_cost=None):
+    """Greedy + global stitch, with auto birth_cost when the knob is omitted."""
+    from .reachability import ReachParams
+
+    params = params or ReachParams()
+    suggest = None
+    if birth_cost is None:
+        birth_cost, suggest = suggest_birth_cost(reach, tracklets, fps, params, w_emb)
+    owner_g = stitch_greedy(reach, tracklets, fps, params, w_emb)
+    owner = stitch_global(reach, tracklets, fps, params, w_emb, birth_cost=birth_cost)
+    owner_compact = compact_path_ids(owner)
+    return {
+        "birth_cost": float(birth_cost),
+        "suggest": suggest,
+        "max_simultaneous": max_simultaneous(tracklets),
+        "n_raw": len(tracklets),
+        "owner_raw": {t.tid: t.tid for t in tracklets},
+        "owner_greedy": owner_g,
+        "owner": owner,
+        "owner_path": owner_compact,
+        "groups_greedy": groups_from_owner(owner_g),
+        "groups": groups_from_owner(owner),
+        "groups_path": groups_from_owner(owner_compact),
+        "n_greedy": len(set(owner_g.values())),
+        "n_global": len(set(owner.values())),
+        "n_path": len(set(owner_compact.values())),
+    }

@@ -99,6 +99,7 @@ gallery/
 models/
 frames/
 bench/data/
+bench/results/
 # generated labelling pages; the .json ground truth is kept
 labels/*.html
 *.npz

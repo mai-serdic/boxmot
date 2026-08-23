@@ -185,12 +185,15 @@ python bench/06_eval_metric_geometry.py --traj runs/traj/MYSITE.json \
 ## What this does and does not buy you
 
 **Does:** a metric floor, so distances are metres and a speed limit is physics
-rather than a tuned pixel budget; an automatically derived occluder map; and
-metric stature as an identity cue that is immune to uniforms, works from
-behind, and survives a coat coming off.
+rather than a tuned pixel budget; and an automatically derived occluder map.
 
-**Does not:** work across days. All of it is session-local by construction.
-Only face (or a badge) answers "is this the same worker as Monday".
+**Does not:** identify people across days, or use stature as an ID cue
+(tested, rejected — see REPORT §12). All of the geometry is session-local.
+Only face (or a badge) answers "is this the same worker as Monday", and face
+is confirm-only because people are seen from behind.
+
+The identity answer for one recording is the offline stitcher
+(`scripts/stitch_traj.py`), not the live tracker. See `docs/DELIVERY.md`.
 
 See `bench/REPORT.md` steps 7–8 for the measurements behind these claims,
 including the honest confidence intervals.
